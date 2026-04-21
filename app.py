@@ -27,7 +27,24 @@ with col2:
 
 process = st.button("Process")
 
+# ----------- UTILS -----------
+
+def normalize(text):
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", str(text).lower()).strip()
+
+def safe_json_parse(content):
+    match = re.search(r'\[.*\]', content, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except:
+            return []
+    return []
+
 # ----------- PDF -----------
+
 def extract_pdf(file):
     text = ""
     try:
@@ -38,37 +55,55 @@ def extract_pdf(file):
         pass
     return text
 
-# ----------- JSON SAFE -----------
-def safe_json_parse(content):
-    match = re.search(r'\[.*\]', content, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except:
-            return []
-    return []
+# ----------- EXCEL PARSER (ТОЧНЫЙ) -----------
 
-# ----------- AI PARSER (PDF ONLY) -----------
+def process_excel(df):
+    items = []
+
+    df = df.fillna("")
+
+    for _, row in df.iterrows():
+        values = [str(v) for v in row.values]
+
+        name = " ".join(values[:3])
+        article = values[0] if values else ""
+
+        items.append({
+            "name": name,
+            "article": article,
+            "quantity": "",
+            "net_weight": "",
+            "gross_weight": "",
+            "price": "",
+            "currency": "",
+            "invoice": "",
+            "invoice_number": ""
+        })
+
+    return items
+
+# ----------- PDF AI -----------
+
 def parse_pdf_ai(text):
     prompt = f"""
-Extract ALL products from this document.
-
-IMPORTANT:
-- There can be many items (10+)
-- Return ALL rows, not one
+Extract ALL products.
 
 Return JSON:
 [
   {{
-    "barcode": "",
-    "article": "",
     "name": "",
+    "article": "",
+    "quantity": "",
+    "net_weight": "",
+    "gross_weight": "",
+    "price": "",
+    "currency": "",
     "invoice": "",
     "invoice_number": ""
   }}
 ]
 
-{text[:8000]}
+{text[:6000]}
 """
 
     response = client.chat.completions.create(
@@ -78,167 +113,88 @@ Return JSON:
 
     return safe_json_parse(response.choices[0].message.content)
 
-# ----------- EXCEL PARSER (ТОЧНЫЙ) -----------
-def process_excel_invoice(df):
-    items = []
+# ----------- MERGE (БЕЗ ОШИБОК) -----------
 
-    for _, row in df.iterrows():
-        values = [str(v) for v in row.values]
-
-        items.append({
-            "barcode": "",
-            "article": " ".join(values[:2]),
-            "name": " ".join(values[:3]),
-            "invoice": "",
-            "invoice_number": ""
-        })
-
-    return items
-
-# ----------- PACKING LIST (AI) -----------
-def process_packing_list(df):
-    text = df.astype(str).to_string()
-
-    prompt = f"""
-Packing list.
-
-Find:
-- product (barcode or article)
-- net weight
-- gross weight
-
-Return JSON:
-[
-  {{
-    "key": "",
-    "net_weight": "",
-    "gross_weight": ""
-  }}
-]
-
-{text[:12000]}
-"""
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        raw = safe_json_parse(response.choices[0].message.content)
-    except:
-        raw = []
-
-    grouped = {}
-
-    for r in raw:
-        key = r.get("key")
-        if not key:
-            continue
-
-        if key not in grouped:
-            grouped[key] = {"barcode": key, "net_weight": 0, "gross_weight": 0}
-
-        try:
-            grouped[key]["net_weight"] += float(r.get("net_weight") or 0)
-            grouped[key]["gross_weight"] += float(r.get("gross_weight") or 0)
-        except:
-            pass
-
-    return list(grouped.values())
-
-# ----------- MERGE -----------
-def merge_data(ai_items, pl_items):
+def merge_items(excel_items, pdf_items):
     merged = []
 
-    for item in ai_items:
-        best_match = None
-        best_score = 0
+    for e in excel_items:
+        best = e.copy()
 
-        for p in pl_items:
-            score = 0
+        for p in pdf_items:
+            if normalize(e["name"])[:15] in normalize(p["name"]):
+                for key in best:
+                    if not best[key] and p.get(key):
+                        best[key] = p[key]
 
-            if item.get("article") and p.get("barcode"):
-                if item["article"].lower()[:10] in p["barcode"].lower():
-                    score += 2
-
-            if item.get("name") and p.get("barcode"):
-                if item["name"].lower()[:10] in p["barcode"].lower():
-                    score += 1
-
-            if score > best_score:
-                best_score = score
-                best_match = p
-
-        if best_match:
-            item["net_weight"] = best_match.get("net_weight")
-            item["gross_weight"] = best_match.get("gross_weight")
-
-        merged.append(item)
+        merged.append(best)
 
     return merged
 
+# ----------- COLUMN MAP -----------
+
+def map_columns(columns):
+    mapping = {}
+
+    for col in columns:
+        c = col.lower()
+
+        if "наимен" in c:
+            mapping[col] = "name"
+        elif "артик" in c or "style" in c:
+            mapping[col] = "article"
+        elif "колич" in c:
+            mapping[col] = "quantity"
+        elif "нетто" in c:
+            mapping[col] = "net_weight"
+        elif "брутто" in c:
+            mapping[col] = "gross_weight"
+        elif "цена" in c:
+            mapping[col] = "price"
+        elif "валюта" in c:
+            mapping[col] = "currency"
+        elif "инвойс" in c:
+            mapping[col] = "invoice"
+        else:
+            mapping[col] = ""
+
+    return mapping
+
 # ----------- MAIN -----------
+
 if process:
 
     if not template_file or not docs:
         st.warning("Upload template and documents")
         st.stop()
 
-    st.info("Processing...")
-
     template_df = pd.read_excel(template_file)
     columns = list(template_df.columns)
 
     pdf_text = ""
     excel_items = []
-    excel_tables = []
 
     for doc in docs:
         if doc.name.endswith(".pdf"):
             pdf_text += extract_pdf(doc)
         else:
             df = pd.read_excel(doc)
-            excel_tables.append(df)
-
-            # извлекаем напрямую
-            excel_items.extend(process_excel_invoice(df))
+            excel_items.extend(process_excel(df))
 
     pdf_items = parse_pdf_ai(pdf_text) if pdf_text else []
-    ai_items = pdf_items + excel_items
 
-    # упаковочные
-    pl_items = []
-    for df in excel_tables:
-        pl_items.extend(process_packing_list(df))
+    items = merge_items(excel_items, pdf_items)
 
-    items = merge_data(ai_items, pl_items)
+    column_map = map_columns(columns)
 
-    # ----------- OUTPUT -----------
     rows = []
 
     for i, item in enumerate(items):
         row = {}
 
-        for idx, col in enumerate(columns):
-            if idx == 0:
-                row[col] = i + 1
-            elif idx == 1:
-                row[col] = item.get("invoice")
-            elif idx == 2:
-                row[col] = item.get("invoice_number")
-            elif idx == 3:
-                row[col] = item.get("barcode")
-            elif idx == 4:
-                row[col] = item.get("name")
-            elif idx == 6:
-                row[col] = item.get("net_weight")
-            elif idx == 7:
-                row[col] = item.get("gross_weight")
-            elif idx == 9:
-                row[col] = item.get("article")
-            else:
-                row[col] = ""
+        for col in columns:
+            field = column_map.get(col, "")
+            row[col] = item.get(field, "")
 
         rows.append(row)
 
