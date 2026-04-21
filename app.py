@@ -109,47 +109,48 @@ def find_header_row(df):
 def extract_spec_items(df):
     df = df.fillna("")
 
-    header_row = find_header_row(df)
-
-    if header_row is None:
-        st.error("❌ Header not found in Excel")
-        return []
-
-    st.write(f"📍 Header detected at row: {header_row}")
-
-    df.columns = df.iloc[header_row]
-    df = df.iloc[header_row + 1:]
-
     items = []
 
     for _, row in df.iterrows():
-        row_dict = {str(k).lower(): str(v).strip() for k, v in row.items()}
 
+        values = [str(v).strip() for v in row.values]
+        row_text = " ".join(values).lower()
+
+        # ❌ пропускаем мусор
+        if any(x in row_text for x in [
+            "invoice", "terms", "delivery", "bank",
+            "address", "seller", "total", "date"
+        ]):
+            continue
+
+        # ❌ слишком коротко
+        if len(row_text) < 5:
+            continue
+
+        # ❗ ИЩЕМ СТРОКУ С ТОВАРОМ
+        if not any(c.isdigit() for c in row_text):
+            continue
+
+        # 🔥 извлекаем смысл
         name = ""
         article = ""
         quantity = ""
         price = ""
 
-        for col, val in row_dict.items():
+        # берём самое длинное значение как название
+        name = max(values, key=len)
 
-            if "наимен" in col or "description" in col:
-                name = val
+        # ищем числа
+        numbers = [v for v in values if re.search(r"\d", v)]
 
-            elif "артик" in col or "code" in col:
-                article = val
+        if len(numbers) > 0:
+            article = numbers[0]
 
-            elif "колич" in col or "qty" in col:
-                quantity = val
+        if len(numbers) > 1:
+            quantity = numbers[1]
 
-            elif "цен" in col or "price" in col:
-                price = val
-
-        # ❗ улучшенный фильтр
-        if len(name) < 3:
-            continue
-
-        if name.lower() in ["nan", "none"]:
-            continue
+        if len(numbers) > 2:
+            price = numbers[2]
 
         items.append({
             "name": name,
