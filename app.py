@@ -105,13 +105,12 @@ def find_header_row(df):
 
     return best_index
 
-
 def extract_spec_items(df):
     df = df.fillna("")
 
     items = []
 
-    # 🔍 сначала определим какие столбцы за что отвечают
+    # 🔍 определяем роли колонок
     col_roles = {}
 
     for col in df.columns:
@@ -129,9 +128,8 @@ def extract_spec_items(df):
         elif "price" in c or "цена" in c:
             col_roles[col] = "price"
 
-    # если не нашли ни одной логики → fallback
     if not col_roles:
-        st.warning("⚠️ No column structure detected, using fallback")
+        st.warning("⚠️ No column structure detected")
 
     for _, row in df.iterrows():
 
@@ -150,7 +148,7 @@ def extract_spec_items(df):
         values = [str(v).strip() for v in row.values]
         row_text = " ".join(values).lower()
 
-        # ❌ мусор
+        # ❌ фильтр мусора
         if any(x in row_text for x in [
             "invoice", "terms", "delivery", "bank",
             "address", "seller", "total"
@@ -175,47 +173,26 @@ def extract_spec_items(df):
                     item["price"] = val
 
         else:
-            # fallback
-            if len(values) > 0:
+            # fallback если нет структуры
+            if values:
                 item["name"] = max(values, key=len)
 
-        # ❌ фильтр
+                numbers = [v for v in values if re.search(r"\d", v)]
+
+                if len(numbers) > 0:
+                    item["article"] = numbers[0]
+                if len(numbers) > 1:
+                    item["quantity"] = numbers[1]
+                if len(numbers) > 2:
+                    item["price"] = numbers[2]
+
+        # ❌ фильтр пустых
         if len(item["name"]) < 3:
             continue
 
         items.append(item)
 
     return items
-
-        # берём самое длинное значение как название
-        name = max(values, key=len)
-
-        # ищем числа
-        numbers = [v for v in values if re.search(r"\d", v)]
-
-        if len(numbers) > 0:
-            article = numbers[0]
-
-        if len(numbers) > 1:
-            quantity = numbers[1]
-
-        if len(numbers) > 2:
-            price = numbers[2]
-
-        items.append({
-            "name": name,
-            "article": article,
-            "quantity": quantity,
-            "price": price,
-            "currency": "",
-            "net_weight": "",
-            "gross_weight": "",
-            "invoice": "",
-            "invoice_number": ""
-        })
-
-    return items
-
 # =========================
 # STEP 3 — PDF ANALYSIS
 # =========================
