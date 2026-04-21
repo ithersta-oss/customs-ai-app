@@ -111,31 +111,81 @@ def extract_spec_items(df):
 
     items = []
 
+    # 🔍 сначала определим какие столбцы за что отвечают
+    col_roles = {}
+
+    for col in df.columns:
+        c = str(col).lower()
+
+        if "наимен" in c or "description" in c:
+            col_roles[col] = "name"
+
+        elif "артик" in c or "code" in c:
+            col_roles[col] = "article"
+
+        elif "колич" in c or "qty" in c:
+            col_roles[col] = "quantity"
+
+        elif "price" in c or "цена" in c:
+            col_roles[col] = "price"
+
+    # если не нашли ни одной логики → fallback
+    if not col_roles:
+        st.warning("⚠️ No column structure detected, using fallback")
+
     for _, row in df.iterrows():
+
+        item = {
+            "name": "",
+            "article": "",
+            "quantity": "",
+            "price": "",
+            "currency": "",
+            "net_weight": "",
+            "gross_weight": "",
+            "invoice": "",
+            "invoice_number": ""
+        }
 
         values = [str(v).strip() for v in row.values]
         row_text = " ".join(values).lower()
 
-        # ❌ пропускаем мусор
+        # ❌ мусор
         if any(x in row_text for x in [
             "invoice", "terms", "delivery", "bank",
-            "address", "seller", "total", "date"
+            "address", "seller", "total"
         ]):
             continue
 
-        # ❌ слишком коротко
-        if len(row_text) < 5:
+        # --- если структура найдена ---
+        if col_roles:
+            for col, role in col_roles.items():
+                val = str(row[col]).strip()
+
+                if role == "name":
+                    item["name"] = val
+
+                elif role == "article":
+                    item["article"] = val
+
+                elif role == "quantity":
+                    item["quantity"] = val
+
+                elif role == "price":
+                    item["price"] = val
+
+        else:
+            # fallback
+            if len(values) > 0:
+                item["name"] = max(values, key=len)
+
+        # ❌ фильтр
+        if len(item["name"]) < 3:
             continue
 
-        # ❗ ИЩЕМ СТРОКУ С ТОВАРОМ
-        if not any(c.isdigit() for c in row_text):
-            continue
+        items.append(item)
 
-        # 🔥 извлекаем смысл
-        name = ""
-        article = ""
-        quantity = ""
-        price = ""
+    return items
 
         # берём самое длинное значение как название
         name = max(values, key=len)
