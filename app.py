@@ -1,51 +1,153 @@
 import streamlit as st
 import pandas as pd
 import pdfplumber
-from openai import OpenAI
-import json
-import tempfile
 import re
+import tempfile
 
-# ----------- API -----------
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-
-st.set_page_config(page_title="Customs AI", layout="wide")
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="AI Customs Assistant", layout="wide")
 st.title("AI Customs Assistant")
 
-# ----------- UI -----------
 col1, col2 = st.columns(2)
 
 with col1:
-    template_file = st.file_uploader("Upload your Excel template", type=["xlsx"])
+    template_file = st.file_uploader("Upload TEMPLATE (Excel)", type=["xlsx"])
 
 with col2:
     docs = st.file_uploader(
-        "Upload your documents (PDF, Excel)",
-        type=["pdf", "xlsx"],
+        "Upload DOCUMENTS (Specification / PDF)",
+        type=["xlsx", "pdf"],
         accept_multiple_files=True
     )
 
 process = st.button("Process")
 
-# ----------- UTILS -----------
+# =========================
+# UTILS
+# =========================
 
-def normalize(text):
-    if not text:
-        return ""
-    return re.sub(r"\s+", " ", str(text).lower()).strip()
+def clean(text):
+    return str(text).strip().lower()
 
-def safe_json_parse(content):
-    match = re.search(r'\[.*\]', content, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except:
-            return []
-    return []
+def is_empty(val):
+    return val is None or str(val).strip() == ""
 
-# ----------- PDF -----------
+# =========================
+# STEP 1 — TEMPLATE ANALYSIS
+# =========================
 
-def extract_pdf(file):
+def analyze_template(df):
+    mapping = {}
+    debug = []
+
+    for col in df.columns:
+        c = clean(col)
+
+        if "наимен" in c:
+            mapping["name"] = col
+
+        elif "артик" in c or "style" in c or "код" in c:
+            mapping["article"] = col
+
+        elif "колич" in c:
+            mapping["quantity"] = col
+
+        elif "нетто" in c:
+            mapping["net_weight"] = col
+
+        elif "брутто" in c:
+            mapping["gross_weight"] = col
+
+        elif "цена" in c:
+            mapping["price"] = col
+
+        elif "валюта" in c:
+            mapping["currency"] = col
+
+        elif "инвойс" in c:
+            mapping["invoice"] = col
+
+        elif "номер" in c:
+            mapping["invoice_number"] = col
+
+        debug.append(f"{col} -> {mapping.get(col, 'not mapped')}")
+
+    return mapping, debug
+
+# =========================
+# STEP 2 — SPEC ANALYSIS
+# =========================
+
+def find_header_row(df):
+    for i in range(len(df)):
+        row_text = " ".join([clean(x) for x in df.iloc[i].values])
+
+        if "наимен" in row_text and ("колич" in row_text or "qty" in row_text):
+            return i
+
+    return None
+
+
+def extract_spec_items(df):
+    df = df.fillna("")
+
+    header_row = find_header_row(df)
+
+    if header_row is None:
+        return []
+
+    df.columns = df.iloc[header_row]
+    df = df.iloc[header_row + 1:]
+
+    items = []
+
+    for _, row in df.iterrows():
+        row_dict = {clean(k): str(v).strip() for k, v in row.items()}
+
+        item = {
+            "name": "",
+            "article": "",
+            "quantity": "",
+            "price": "",
+            "currency": "",
+            "net_weight": "",
+            "gross_weight": "",
+            "invoice": "",
+            "invoice_number": ""
+        }
+
+        for col, val in row_dict.items():
+
+            if "наимен" in col:
+                item["name"] = val
+
+            elif "артик" in col or "код" in col:
+                item["article"] = val
+
+            elif "колич" in col:
+                item["quantity"] = val
+
+            elif "цен" in col:
+                item["price"] = val
+
+        # фильтр мусора
+        if len(item["name"]) < 3:
+            continue
+
+        if not any(c.isdigit() for c in item["name"]):
+            continue
+
+        items.append(item)
+
+    return items
+
+# =========================
+# STEP 3 — PDF ANALYSIS
+# =========================
+
+def extract_pdf_text(file):
     text = ""
     try:
         with pdfplumber.open(file) as pdf:
@@ -55,154 +157,101 @@ def extract_pdf(file):
         pass
     return text
 
-# ----------- EXCEL PARSER (ТОЧНЫЙ) -----------
+# =========================
+# STEP 4 — MERGE LOGIC
+# =========================
 
-def process_excel(df):
-    items = []
-
-    df = df.fillna("")
-
-    for _, row in df.iterrows():
-        values = [str(v) for v in row.values]
-
-        name = " ".join(values[:3])
-        article = values[0] if values else ""
-
-        items.append({
-            "name": name,
-            "article": article,
-            "quantity": "",
-            "net_weight": "",
-            "gross_weight": "",
-            "price": "",
-            "currency": "",
-            "invoice": "",
-            "invoice_number": ""
-        })
-
+def merge_items(items):
+    # пока просто возвращаем как есть (можно улучшить)
     return items
 
-# ----------- PDF AI -----------
+# =========================
+# STEP 5 — BUILD RESULT
+# =========================
 
-def parse_pdf_ai(text):
-    prompt = f"""
-Extract ALL products.
-
-Return JSON:
-[
-  {{
-    "name": "",
-    "article": "",
-    "quantity": "",
-    "net_weight": "",
-    "gross_weight": "",
-    "price": "",
-    "currency": "",
-    "invoice": "",
-    "invoice_number": ""
-  }}
-]
-
-{text[:6000]}
-"""
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return safe_json_parse(response.choices[0].message.content)
-
-# ----------- MERGE (БЕЗ ОШИБОК) -----------
-
-def merge_items(excel_items, pdf_items):
-    merged = []
-
-    for e in excel_items:
-        best = e.copy()
-
-        for p in pdf_items:
-            if normalize(e["name"])[:15] in normalize(p["name"]):
-                for key in best:
-                    if not best[key] and p.get(key):
-                        best[key] = p[key]
-
-        merged.append(best)
-
-    return merged
-
-# ----------- COLUMN MAP -----------
-
-def map_columns(columns):
-    mapping = {}
-
-    for col in columns:
-        c = col.lower()
-
-        if "наимен" in c:
-            mapping[col] = "name"
-        elif "артик" in c or "style" in c:
-            mapping[col] = "article"
-        elif "колич" in c:
-            mapping[col] = "quantity"
-        elif "нетто" in c:
-            mapping[col] = "net_weight"
-        elif "брутто" in c:
-            mapping[col] = "gross_weight"
-        elif "цена" in c:
-            mapping[col] = "price"
-        elif "валюта" in c:
-            mapping[col] = "currency"
-        elif "инвойс" in c:
-            mapping[col] = "invoice"
-        else:
-            mapping[col] = ""
-
-    return mapping
-
-# ----------- MAIN -----------
-
-if process:
-
-    if not template_file or not docs:
-        st.warning("Upload template and documents")
-        st.stop()
-
-    template_df = pd.read_excel(template_file)
-    columns = list(template_df.columns)
-
-    pdf_text = ""
-    excel_items = []
-
-    for doc in docs:
-        if doc.name.endswith(".pdf"):
-            pdf_text += extract_pdf(doc)
-        else:
-            df = pd.read_excel(doc)
-            excel_items.extend(process_excel(df))
-
-    pdf_items = parse_pdf_ai(pdf_text) if pdf_text else []
-
-    items = merge_items(excel_items, pdf_items)
-
-    column_map = map_columns(columns)
+def build_output(items, template_map, template_columns):
 
     rows = []
 
     for i, item in enumerate(items):
         row = {}
 
-        for col in columns:
-            field = column_map.get(col, "")
-            row[col] = item.get(field, "")
+        for col in template_columns:
+
+            if col in template_map.values():
+
+                # находим ключ
+                key = None
+                for k, v in template_map.items():
+                    if v == col:
+                        key = k
+                        break
+
+                row[col] = item.get(key, "")
+
+            else:
+                row[col] = ""
 
         rows.append(row)
 
-    result_df = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+
+# =========================
+# MAIN
+# =========================
+
+if process:
+
+    if not template_file:
+        st.warning("Upload template")
+        st.stop()
+
+    if not docs:
+        st.warning("Upload documents")
+        st.stop()
+
+    st.info("Processing...")
+
+    # -------- TEMPLATE --------
+    template_df = pd.read_excel(template_file)
+
+    template_map, debug = analyze_template(template_df)
+
+    st.write("🔍 Template mapping:")
+    st.write(template_map)
+
+    # -------- DOCUMENTS --------
+    all_items = []
+
+    for doc in docs:
+
+        if doc.name.endswith(".xlsx"):
+            df = pd.read_excel(doc)
+
+            items = extract_spec_items(df)
+
+            st.write(f"📄 {doc.name} → {len(items)} items")
+
+            all_items.extend(items)
+
+        elif doc.name.endswith(".pdf"):
+            text = extract_pdf_text(doc)
+            st.write(f"📄 PDF loaded ({len(text)} chars)")
+
+    # -------- MERGE --------
+    final_items = merge_items(all_items)
+
+    # -------- OUTPUT --------
+    result_df = build_output(
+        final_items,
+        template_map,
+        template_df.columns
+    )
 
     st.success("Done")
     st.dataframe(result_df)
 
+    # download
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         result_df.to_excel(tmp.name, index=False)
 
