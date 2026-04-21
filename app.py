@@ -53,23 +53,30 @@ def safe_json_parse(content):
     return []
 
 def parse_pdf_ai(text):
-    prompt = f"""
-    Extract structured customs data.
+   prompt = f"""
+Ты работаешь с таможенными документами.
 
-    Return ONLY JSON:
-    [
-      {{
-        "barcode": "",
-        "article": "",
-        "name": "",
-        "invoice": "",
-        "invoice_number": ""
-      }}
-    ]
+Колонки шаблона:
+{columns}
 
-    Text:
-    {text[:15000]}
-    """
+Извлеки данные товаров максимально точно.
+
+Если нет штрихкода — используй артикул или название.
+
+Верни JSON:
+[
+  {{
+    "barcode": "",
+    "article": "",
+    "name": "",
+    "invoice": "",
+    "invoice_number": ""
+  }}
+]
+
+Текст:
+{text[:8000]}
+"""
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -82,33 +89,81 @@ def parse_pdf_ai(text):
 # ----------- PACKING LIST -----------
 def process_packing_list(df):
     df = df.copy()
-    df.columns = [str(c).lower() for c in df.columns]
 
-    def find_col(names):
-        for c in df.columns:
-            for n in names:
-                if n in c:
-                    return c
-        return None
+    # всё приводим к строкам
+    df = df.astype(str)
 
-    barcode_col = find_col(["barcode", "штрих", "ean", "code"])
-    article_col = find_col(["article", "артикул"])
-    net_col = find_col(["net", "нетто"])
-    gross_col = find_col(["gross", "брутто"])
+    text = df.to_string()
 
-    results = []
+    # ---------- AI анализ ----------
+    prompt = f"""
+    Это упаковочный лист (packing list).
+    Данные могут быть разбросаны.
 
-    if barcode_col or article_col:
-        for _, row in df.iterrows():
-            key = row.get(barcode_col) if barcode_col else row.get(article_col)
+    Найди для каждого товара:
+    - штрихкод (или артикул)
+    - вес нетто
+    - вес брутто
 
-            if pd.notna(key):
-                results.append({
-                    "barcode": str(key),
-                    "article": row.get(article_col),
-                    "net_weight": row.get(net_col),
-                    "gross_weight": row.get(gross_col)
-                })
+    Важно:
+    - вес может быть в разных строках
+    - могут быть повторы → их нужно суммировать
+
+    Верни JSON:
+    [
+      {{
+        "key": "",  # barcode или article
+        "net_weight": "",
+        "gross_weight": ""
+      }}
+    ]
+
+    Таблица:
+    {text[:12000]}
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        content = response.choices[0].message.content
+
+        import re
+        match = re.search(r'\[.*\]', content, re.DOTALL)
+
+        if match:
+            raw = json.loads(match.group())
+        else:
+            raw = []
+
+    except:
+        raw = []
+
+    # ---------- агрегация ----------
+    grouped = {}
+
+    for r in raw:
+        key = r.get("key")
+
+        if not key:
+            continue
+
+        if key not in grouped:
+            grouped[key] = {
+                "barcode": key,
+                "net_weight": 0,
+                "gross_weight": 0
+            }
+
+        try:
+            grouped[key]["net_weight"] += float(r.get("net_weight") or 0)
+            grouped[key]["gross_weight"] += float(r.get("gross_weight") or 0)
+        except:
+            pass
+
+    return list(grouped.values())
 
     # агрегируем
     grouped = {}
@@ -139,6 +194,40 @@ def merge_data(ai_items, pl_items):
     merged = []
 
     for item in ai_items:
+        best_match = None
+        best_score = 0
+
+        for p in pl_items:
+            score = 0
+
+            # совпадение по barcode
+            if item.get("barcode") and p.get("barcode"):
+                if item["barcode"] == p["barcode"]:
+                    score += 3
+
+            # совпадение по артикулу
+            if item.get("article") and p.get("article"):
+                if str(item["article"]).lower() in str(p["article"]).lower():
+                    score += 2
+
+            # совпадение по названию
+            if item.get("name") and p.get("barcode"):
+                if str(item["name"]).lower()[:10] in str(p["barcode"]).lower():
+                    score += 1
+
+            if score > best_score:
+                best_score = score
+                best_match = p
+
+        if best_match:
+            item["net_weight"] = best_match.get("net_weight")
+            item["gross_weight"] = best_match.get("gross_weight")
+
+        merged.append(item)
+
+    return merged
+
+    for item in ai_items:
         key = item.get("barcode")
 
         match = next(
@@ -159,21 +248,24 @@ def validate(items):
     errors = []
 
     for item in items:
+
         net = item.get("net_weight")
         gross = item.get("gross_weight")
 
         try:
             if net and gross:
                 if float(net) > float(gross):
-                    errors.append(f"❌ Net > Gross ({item.get('barcode')})")
+                    errors.append(f"❌ Net > Gross ({item.get('name')})")
         except:
             pass
 
-        if not item.get("barcode"):
-            errors.append("❌ Missing barcode")
+        if not item.get("net_weight"):
+            errors.append(f"⚠️ Missing net weight ({item.get('name')})")
+
+        if not item.get("gross_weight"):
+            errors.append(f"⚠️ Missing gross weight ({item.get('name')})")
 
     return errors
-
 # ----------- MAIN -----------
 if process:
 
