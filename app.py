@@ -7,11 +7,7 @@ import tempfile
 import re
 
 # ----------- API -----------
-try:
-    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-except:
-    st.error("❌ API key not found")
-    st.stop()
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 st.set_page_config(page_title="Customs AI", layout="wide")
 st.title("AI Customs Assistant")
@@ -52,19 +48,16 @@ def safe_json_parse(content):
             return []
     return []
 
-# ----------- AI PARSER -----------
-def parse_pdf_ai(text, columns):
+# ----------- AI PARSER (PDF ONLY) -----------
+def parse_pdf_ai(text):
     prompt = f"""
-Ты работаешь с таможенными документами.
+Extract ALL products from this document.
 
-Колонки шаблона:
-{columns}
+IMPORTANT:
+- There can be many items (10+)
+- Return ALL rows, not one
 
-Извлеки товары.
-
-Если нет штрихкода — используй артикул или название.
-
-Верни JSON:
+Return JSON:
 [
   {{
     "barcode": "",
@@ -85,20 +78,36 @@ def parse_pdf_ai(text, columns):
 
     return safe_json_parse(response.choices[0].message.content)
 
-# ----------- PACKING LIST -----------
+# ----------- EXCEL PARSER (ТОЧНЫЙ) -----------
+def process_excel_invoice(df):
+    items = []
+
+    for _, row in df.iterrows():
+        values = [str(v) for v in row.values]
+
+        items.append({
+            "barcode": "",
+            "article": " ".join(values[:2]),
+            "name": " ".join(values[:3]),
+            "invoice": "",
+            "invoice_number": ""
+        })
+
+    return items
+
+# ----------- PACKING LIST (AI) -----------
 def process_packing_list(df):
-    df = df.astype(str)
-    text = df.to_string()
+    text = df.astype(str).to_string()
 
     prompt = f"""
-Это упаковочный лист.
+Packing list.
 
-Найди:
-- товар (barcode или article)
-- вес нетто
-- вес брутто
+Find:
+- product (barcode or article)
+- net weight
+- gross weight
 
-Верни JSON:
+Return JSON:
 [
   {{
     "key": "",
@@ -149,16 +158,12 @@ def merge_data(ai_items, pl_items):
         for p in pl_items:
             score = 0
 
-            if item.get("barcode") and p.get("barcode"):
-                if item["barcode"] == p["barcode"]:
-                    score += 3
-
             if item.get("article") and p.get("barcode"):
-                if str(item["article"]).lower() in str(p["barcode"]).lower():
+                if item["article"].lower()[:10] in p["barcode"].lower():
                     score += 2
 
             if item.get("name") and p.get("barcode"):
-                if str(item["name"]).lower()[:10] in str(p["barcode"]).lower():
+                if item["name"].lower()[:10] in p["barcode"].lower():
                     score += 1
 
             if score > best_score:
@@ -173,22 +178,6 @@ def merge_data(ai_items, pl_items):
 
     return merged
 
-# ----------- VALIDATION -----------
-def validate(items):
-    errors = []
-
-    for item in items:
-        net = item.get("net_weight")
-        gross = item.get("gross_weight")
-
-        try:
-            if net and gross and float(net) > float(gross):
-                errors.append(f"❌ Net > Gross ({item.get('name')})")
-        except:
-            pass
-
-    return errors
-
 # ----------- MAIN -----------
 if process:
 
@@ -202,33 +191,35 @@ if process:
     columns = list(template_df.columns)
 
     pdf_text = ""
+    excel_items = []
     excel_tables = []
 
     for doc in docs:
         if doc.name.endswith(".pdf"):
             pdf_text += extract_pdf(doc)
         else:
-            try:
-                excel_tables.append(pd.read_excel(doc))
-            except:
-                pass
+            df = pd.read_excel(doc)
+            excel_tables.append(df)
 
-    ai_items = parse_pdf_ai(pdf_text, columns)
+            # извлекаем напрямую
+            excel_items.extend(process_excel_invoice(df))
 
+    pdf_items = parse_pdf_ai(pdf_text) if pdf_text else []
+    ai_items = pdf_items + excel_items
+
+    # упаковочные
     pl_items = []
     for df in excel_tables:
         pl_items.extend(process_packing_list(df))
 
     items = merge_data(ai_items, pl_items)
 
-    errors = validate(items)
-    if errors:
-        st.warning(errors)
-
+    # ----------- OUTPUT -----------
     rows = []
 
     for i, item in enumerate(items):
         row = {}
+
         for idx, col in enumerate(columns):
             if idx == 0:
                 row[col] = i + 1
@@ -248,6 +239,7 @@ if process:
                 row[col] = item.get("article")
             else:
                 row[col] = ""
+
         rows.append(row)
 
     result_df = pd.DataFrame(rows)
