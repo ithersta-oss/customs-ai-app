@@ -81,13 +81,29 @@ def analyze_template(df):
 # =========================
 
 def find_header_row(df):
+    best_score = 0
+    best_index = None
+
     for i in range(len(df)):
-        row_text = " ".join([clean(x) for x in df.iloc[i].values])
+        row = [str(x).lower() for x in df.iloc[i].values]
 
-        if "наимен" in row_text and ("колич" in row_text or "qty" in row_text):
-            return i
+        score = 0
 
-    return None
+        for cell in row:
+            if "наимен" in cell or "description" in cell:
+                score += 3
+            if "колич" in cell or "qty" in cell:
+                score += 2
+            if "price" in cell or "цена" in cell:
+                score += 1
+            if "артик" in cell or "code" in cell:
+                score += 1
+
+        if score > best_score:
+            best_score = score
+            best_index = i
+
+    return best_index
 
 
 def extract_spec_items(df):
@@ -96,7 +112,10 @@ def extract_spec_items(df):
     header_row = find_header_row(df)
 
     if header_row is None:
+        st.error("❌ Header not found in Excel")
         return []
+
+    st.write(f"📍 Header detected at row: {header_row}")
 
     df.columns = df.iloc[header_row]
     df = df.iloc[header_row + 1:]
@@ -104,42 +123,45 @@ def extract_spec_items(df):
     items = []
 
     for _, row in df.iterrows():
-        row_dict = {clean(k): str(v).strip() for k, v in row.items()}
+        row_dict = {str(k).lower(): str(v).strip() for k, v in row.items()}
 
-        item = {
-            "name": "",
-            "article": "",
-            "quantity": "",
-            "price": "",
+        name = ""
+        article = ""
+        quantity = ""
+        price = ""
+
+        for col, val in row_dict.items():
+
+            if "наимен" in col or "description" in col:
+                name = val
+
+            elif "артик" in col or "code" in col:
+                article = val
+
+            elif "колич" in col or "qty" in col:
+                quantity = val
+
+            elif "цен" in col or "price" in col:
+                price = val
+
+        # ❗ улучшенный фильтр
+        if len(name) < 3:
+            continue
+
+        if name.lower() in ["nan", "none"]:
+            continue
+
+        items.append({
+            "name": name,
+            "article": article,
+            "quantity": quantity,
+            "price": price,
             "currency": "",
             "net_weight": "",
             "gross_weight": "",
             "invoice": "",
             "invoice_number": ""
-        }
-
-        for col, val in row_dict.items():
-
-            if "наимен" in col:
-                item["name"] = val
-
-            elif "артик" in col or "код" in col:
-                item["article"] = val
-
-            elif "колич" in col:
-                item["quantity"] = val
-
-            elif "цен" in col:
-                item["price"] = val
-
-        # фильтр мусора
-        if len(item["name"]) < 3:
-            continue
-
-        if not any(c.isdigit() for c in item["name"]):
-            continue
-
-        items.append(item)
+        })
 
     return items
 
