@@ -10,7 +10,7 @@ import re
 try:
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 except:
-    st.error("❌ API key not found. Add it in Streamlit Secrets.")
+    st.error("❌ API key not found")
     st.stop()
 
 st.set_page_config(page_title="Customs AI", layout="wide")
@@ -42,7 +42,7 @@ def extract_pdf(file):
         pass
     return text
 
-# ----------- AI PARSER -----------
+# ----------- JSON SAFE -----------
 def safe_json_parse(content):
     match = re.search(r'\[.*\]', content, re.DOTALL)
     if match:
@@ -52,14 +52,15 @@ def safe_json_parse(content):
             return []
     return []
 
-def parse_pdf_ai(text):
-   prompt = f"""
+# ----------- AI PARSER -----------
+def parse_pdf_ai(text, columns):
+    prompt = f"""
 Ты работаешь с таможенными документами.
 
 Колонки шаблона:
 {columns}
 
-Извлеки данные товаров максимально точно.
+Извлеки товары.
 
 Если нет штрихкода — используй артикул или название.
 
@@ -74,7 +75,6 @@ def parse_pdf_ai(text):
   }}
 ]
 
-Текст:
 {text[:8000]}
 """
 
@@ -83,44 +83,32 @@ def parse_pdf_ai(text):
         messages=[{"role": "user", "content": prompt}]
     )
 
-    content = response.choices[0].message.content
-    return safe_json_parse(content)
+    return safe_json_parse(response.choices[0].message.content)
 
 # ----------- PACKING LIST -----------
 def process_packing_list(df):
-    df = df.copy()
-
-    # всё приводим к строкам
     df = df.astype(str)
-
     text = df.to_string()
 
-    # ---------- AI анализ ----------
     prompt = f"""
-    Это упаковочный лист (packing list).
-    Данные могут быть разбросаны.
+Это упаковочный лист.
 
-    Найди для каждого товара:
-    - штрихкод (или артикул)
-    - вес нетто
-    - вес брутто
+Найди:
+- товар (barcode или article)
+- вес нетто
+- вес брутто
 
-    Важно:
-    - вес может быть в разных строках
-    - могут быть повторы → их нужно суммировать
+Верни JSON:
+[
+  {{
+    "key": "",
+    "net_weight": "",
+    "gross_weight": ""
+  }}
+]
 
-    Верни JSON:
-    [
-      {{
-        "key": "",  # barcode или article
-        "net_weight": "",
-        "gross_weight": ""
-      }}
-    ]
-
-    Таблица:
-    {text[:12000]}
-    """
+{text[:12000]}
+"""
 
     try:
         response = client.chat.completions.create(
@@ -128,58 +116,19 @@ def process_packing_list(df):
             messages=[{"role": "user", "content": prompt}]
         )
 
-        content = response.choices[0].message.content
-
-        import re
-        match = re.search(r'\[.*\]', content, re.DOTALL)
-
-        if match:
-            raw = json.loads(match.group())
-        else:
-            raw = []
-
+        raw = safe_json_parse(response.choices[0].message.content)
     except:
         raw = []
 
-    # ---------- агрегация ----------
     grouped = {}
 
     for r in raw:
         key = r.get("key")
-
         if not key:
             continue
 
         if key not in grouped:
-            grouped[key] = {
-                "barcode": key,
-                "net_weight": 0,
-                "gross_weight": 0
-            }
-
-        try:
-            grouped[key]["net_weight"] += float(r.get("net_weight") or 0)
-            grouped[key]["gross_weight"] += float(r.get("gross_weight") or 0)
-        except:
-            pass
-
-    return list(grouped.values())
-
-    # агрегируем
-    grouped = {}
-
-    for r in results:
-        key = r.get("barcode") or r.get("article")
-
-        if not key:
-            continue
-
-        if key not in grouped:
-            grouped[key] = {
-                "barcode": key,
-                "net_weight": 0,
-                "gross_weight": 0
-            }
+            grouped[key] = {"barcode": key, "net_weight": 0, "gross_weight": 0}
 
         try:
             grouped[key]["net_weight"] += float(r.get("net_weight") or 0)
@@ -200,17 +149,14 @@ def merge_data(ai_items, pl_items):
         for p in pl_items:
             score = 0
 
-            # совпадение по barcode
             if item.get("barcode") and p.get("barcode"):
                 if item["barcode"] == p["barcode"]:
                     score += 3
 
-            # совпадение по артикулу
-            if item.get("article") and p.get("article"):
-                if str(item["article"]).lower() in str(p["article"]).lower():
+            if item.get("article") and p.get("barcode"):
+                if str(item["article"]).lower() in str(p["barcode"]).lower():
                     score += 2
 
-            # совпадение по названию
             if item.get("name") and p.get("barcode"):
                 if str(item["name"]).lower()[:10] in str(p["barcode"]).lower():
                     score += 1
@@ -227,70 +173,33 @@ def merge_data(ai_items, pl_items):
 
     return merged
 
-    for item in ai_items:
-        key = item.get("barcode")
-
-        match = next(
-            (p for p in pl_items if p["barcode"] == key),
-            None
-        )
-
-        if match:
-            item["net_weight"] = match["net_weight"]
-            item["gross_weight"] = match["gross_weight"]
-
-        merged.append(item)
-
-    return merged
-
 # ----------- VALIDATION -----------
 def validate(items):
     errors = []
 
     for item in items:
-
         net = item.get("net_weight")
         gross = item.get("gross_weight")
 
         try:
-            if net and gross:
-                if float(net) > float(gross):
-                    errors.append(f"❌ Net > Gross ({item.get('name')})")
+            if net and gross and float(net) > float(gross):
+                errors.append(f"❌ Net > Gross ({item.get('name')})")
         except:
             pass
 
-        if not item.get("net_weight"):
-            errors.append(f"⚠️ Missing net weight ({item.get('name')})")
-
-        if not item.get("gross_weight"):
-            errors.append(f"⚠️ Missing gross weight ({item.get('name')})")
-
     return errors
+
 # ----------- MAIN -----------
 if process:
 
-    if not template_file:
-        st.warning("Upload template first")
-        st.stop()
-
-    if not docs:
-        st.warning("Upload documents")
+    if not template_file or not docs:
+        st.warning("Upload template and documents")
         st.stop()
 
     st.info("Processing...")
 
-    try:
-        template_df = pd.read_excel(template_file)
-    except:
-        st.error("Template read error")
-        st.stop()
-
+    template_df = pd.read_excel(template_file)
     columns = list(template_df.columns)
-
-    # безопасно проверяем колонки
-    if len(columns) < 5:
-        st.error("Template has too few columns")
-        st.stop()
 
     pdf_text = ""
     excel_tables = []
@@ -304,29 +213,22 @@ if process:
             except:
                 pass
 
-    # AI
-    ai_items = parse_pdf_ai(pdf_text)
+    ai_items = parse_pdf_ai(pdf_text, columns)
 
-    # PL
     pl_items = []
     for df in excel_tables:
         pl_items.extend(process_packing_list(df))
 
-    # Merge
     items = merge_data(ai_items, pl_items)
 
-    # Validation
     errors = validate(items)
-
     if errors:
         st.warning(errors)
 
-    # Build result
     rows = []
 
     for i, item in enumerate(items):
         row = {}
-
         for idx, col in enumerate(columns):
             if idx == 0:
                 row[col] = i + 1
@@ -338,21 +240,14 @@ if process:
                 row[col] = item.get("barcode")
             elif idx == 4:
                 row[col] = item.get("name")
-            elif idx == 5:
-                row[col] = ""
             elif idx == 6:
                 row[col] = item.get("net_weight")
             elif idx == 7:
                 row[col] = item.get("gross_weight")
-            elif idx == 8:
-                row[col] = item.get("volume")
             elif idx == 9:
                 row[col] = item.get("article")
-            elif idx == 10:
-                row[col] = item.get("certificate")
             else:
                 row[col] = ""
-
         rows.append(row)
 
     result_df = pd.DataFrame(rows)
